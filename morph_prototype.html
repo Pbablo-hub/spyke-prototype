@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Three‑JS Morph Prototype – Separate Easings</title>
+  
+  <!-- Import map so utility helpers can `import 'three'` in the browser -->
+  <script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.164/build/three.module.js"}}</script>
+  <style>
+    html,body{margin:0;height:100%;overflow:hidden;background:#000;}
+    canvas{display:block;}
+    #info{position:fixed;top:1rem;left:50%;transform:translateX(-50%);color:#eee;font:14px/1 sans-serif;background:rgba(0,0,0,.55);padding:.4rem .8rem;border-radius:.35rem;pointer-events:none;user-select:none}
+  </style>
+</head>
+<body>
+<div id="info">Click object to morph • Drag to orbit</div>
+<script type="module">
+/**************************************************
+ * Imports
+ *************************************************/
+import * as THREE           from 'three';
+import { OrbitControls }    from 'https://cdn.jsdelivr.net/npm/three@0.164/examples/jsm/controls/OrbitControls.js';
+import { GLTFLoader }       from 'https://cdn.jsdelivr.net/npm/three@0.164/examples/jsm/loaders/GLTFLoader.js';
+import { RGBELoader }       from 'https://cdn.jsdelivr.net/npm/three@0.164/examples/jsm/loaders/RGBELoader.js';
+
+/**************************************************
+ * User‑friendly knobs
+ *************************************************/
+const glbPath      = 'Shape3.glb';              // your model
+const hdriPath     = 'studio_small_09_2k.hdr'; // optional env map
+
+// Durations (s)
+const morphDuration = 0.5;
+const rotDuration   = 0.9;
+
+// Easing parameters
+const morphOvershoot = 1.4;  // easeOutBack overshoot for morph
+const rotEasePower   = 8;    // easeOutCubic (3) / Quart (4) etc.
+
+// Rotation amount per click
+const rotationStep = Math.PI * 0.5; // 90°
+
+// Material look
+const baseColor = 0xb2b2b2;
+const metalness = 0.9;
+const roughness = 0.35;
+
+/**************************************************
+ * Scene basics
+ *************************************************/
+const scene = new THREE.Scene();
+
+const renderer = new THREE.WebGLRenderer({antialias:true});
+renderer.setPixelRatio(devicePixelRatio);
+renderer.setSize(innerWidth, innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1;
+document.body.appendChild(renderer.domElement);
+
+const camera = new THREE.PerspectiveCamera(45, innerWidth/innerHeight, 0.1, 100);
+camera.position.set(0,1.2,3);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+
+// Simple lights (always on)
+scene.add(new THREE.HemisphereLight(0xffffff,0x444444,0.6));
+const dir = new THREE.DirectionalLight(0xffffff,0.8);
+dir.position.set(5,10,7);
+scene.add(dir);
+
+// Optional HDRI env
+if(hdriPath){
+  const pm = new THREE.PMREMGenerator(renderer);
+  new RGBELoader().load(hdriPath, tex=>{
+    const env = pm.fromEquirectangular(tex).texture;
+    scene.environment = env;
+    // scene.background = env; // uncomment to see bg
+    tex.dispose(); pm.dispose();
+  });
+}
+
+/**************************************************
+ * Load GLB
+ *************************************************/
+let mesh, morphCount=0;
+new GLTFLoader().load(glbPath, gltf=>{
+  gltf.scene.traverse(o=>{ if(o.isMesh && !mesh) mesh=o; });
+  if(!mesh){ console.error('No mesh in GLB'); return; }
+
+  // Metallic material override
+  mesh.material = new THREE.MeshStandardMaterial({
+    color: baseColor, metalness, roughness, envMapIntensity:1
+  });
+
+  if(mesh.geometry) mesh.geometry.computeVertexNormals();
+
+  scene.add(gltf.scene);
+  morphCount = mesh.morphTargetInfluences?.length || 0;
+  fitCamera(mesh,1.2);
+}, undefined, err=>console.error(err));
+
+/**************************************************
+ * Easing helpers
+ *************************************************/
+function easeOutBack(t){
+  const s = morphOvershoot;
+  return 1 + (s+1)*Math.pow(t-1,3) + s*Math.pow(t-1,2);
+}
+function easeOutPower(t,p){ return 1 - Math.pow(1-t,p); } // generic pow ease
+
+/**************************************************
+ * Tween state
+ *************************************************/
+let morphFrom=-1, morphTo=-1, morphTime=0;
+let rotStart=0, rotEnd=0, rotTime=0;
+const clock = new THREE.Clock();
+
+function triggerMorph(){
+  if(!mesh || !morphCount) return;
+  morphFrom = morphTo;
+  morphTo   = (morphTo+1)%morphCount;
+  morphTime = 0;
+
+  rotStart = mesh.rotation.y;
+  rotEnd   = rotStart + rotationStep;
+  rotTime  = 0;
+}
+
+// click vs drag discrimination
+let down=null;
+renderer.domElement.addEventListener('pointerdown',e=>down=[e.clientX,e.clientY]);
+renderer.domElement.addEventListener('pointerup',e=>{
+  if(!down) return;
+  const dX=e.clientX-down[0], dY=e.clientY-down[1];
+  down=null;
+  if(Math.hypot(dX,dY)<5) triggerMorph();
+});
+
+/**************************************************
+ * Render loop
+ *************************************************/
+function render(){
+  requestAnimationFrame(render);
+  const dt = clock.getDelta();
+  controls.update();
+
+  // Morph tween
+  if(mesh && morphTo>=0 && morphTime<morphDuration){
+    morphTime = Math.min(morphTime+dt, morphDuration);
+    const t = morphTime/morphDuration;
+    const e = easeOutBack(t);
+    if(morphFrom>=0) mesh.morphTargetInfluences[morphFrom]=1-e;
+    mesh.morphTargetInfluences[morphTo]=e;
+  }
+
+  // Rotation tween (independent easing/duration)
+  if(mesh && rotTime<rotDuration){
+    rotTime = Math.min(rotTime+dt, rotDuration);
+    const tR = rotTime/rotDuration;
+    const eR = easeOutPower(tR, rotEasePower);
+    mesh.rotation.y = THREE.MathUtils.lerp(rotStart, rotEnd, eR);
+  }
+
+  renderer.render(scene,camera);
+}
+render();
+
+/**************************************************
+ * Utils
+ *************************************************/
+function fitCamera(object, zoom=1.2){
+  const box=new THREE.Box3().setFromObject(object);
+  const sphere=box.getBoundingSphere(new THREE.Sphere());
+  const radius=sphere.radius*zoom;
+  const halfFov=THREE.MathUtils.degToRad(camera.fov*0.5);
+  const dist=radius/Math.sin(halfFov);
+  camera.position.copy(sphere.center).add(new THREE.Vector3(0,0,dist));
+  camera.near=Math.max(0.1, dist-radius*.5);
+  camera.far =dist+radius*1.5;
+  camera.updateProjectionMatrix();
+  controls.target.copy(sphere.center);
+  controls.maxDistance=camera.far*0.9;
+  controls.minDistance=radius*0.2;
+}
+
+window.addEventListener('resize',()=>{
+  camera.aspect=innerWidth/innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth,innerHeight);
+});
+</script>
+</body>
+</html>
